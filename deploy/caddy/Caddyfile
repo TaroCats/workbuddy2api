@@ -1,0 +1,69 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 统一反代入口
+#
+# 面板刻意不直接对外发布端口（见 docker-compose.fork.yml 里 wbgui 那条）——
+# 管理面板持有全部账号凭据，直连公网是被打穿的常见原因，官方也要求它藏在反代之后。
+#
+# 站点地址由 WGUI_SITE 决定（改 .env，不用改本文件）：
+#   WGUI_SITE 留空              → 监听 :80，用 http://<服务器IP>/ 访问（无 HTTPS）
+#   WGUI_SITE=panel.你的域名    → 自动监听 80/443 并签发、续期 Let's Encrypt 证书
+#     前提：域名已解析到本机，且 80/443 从公网可达，否则签发会失败。
+#
+# 想给网关 API 也配个域名（客户端填 https://api.你的域名/v1），
+# 打开文件末尾那段注释，并在 .env 里设置 API_SITE。
+# ─────────────────────────────────────────────────────────────────────────────
+{
+	# 关掉管理 API：它默认在 :2019 上暴露一个可整体改写配置的接口，
+	# 容器里由 Caddyfile 静态提供配置，没有开它的必要。
+	admin off
+
+	# 访问日志走 stdout，交给 docker 的日志驱动做轮转与限大小
+	log {
+		output stdout
+		format console
+	}
+}
+
+# ── 控制台面板 ──────────────────────────────────────────────────────────────
+# 注意 `:80` 这个默认值的语义：Caddy 的 {$VAR:default} 只在变量**未设置**时才用默认值；
+# 变量被设成**空串**时，展开结果就是空 —— 站点地址为空会让整个块变成无标签的块，
+# caddy 会直接拒绝启动：
+#     Error: adapting config using caddyfile: server block without any key is global configuration
+# 所以本文件要求 WGUI_SITE 必须非空。这一条由 compose 保证：那边写的是
+#     WGUI_SITE: ${WGUI_SITE:-:80}
+# 用的是 `:-`（未设置**或为空**都取默认），.env 里留空也会被换成 :80。
+# 反过来说：**别绕过 compose 直接 `caddy run` 还传一个空的 WGUI_SITE**，那会起不来。
+{$WGUI_SITE::80} {
+	encode zstd gzip
+
+	header {
+		# 管理后台不该被搜索引擎收录
+		X-Robots-Tag "noindex, nofollow"
+		# 面板内容（含会话态）不允许被任何中间层缓存
+		Cache-Control "no-store"
+		# 不对外暴露后端软件的指纹
+		-Server
+	}
+
+	reverse_proxy wbgui:8787 {
+		# 让面板记到真实客户端 IP —— 它自己有调用审计与 IP 白/黑名单，
+		# 不传真实 IP 的话那些功能记到的全是 Caddy 的容器地址。
+		# （X-Forwarded-For / -Proto 由 reverse_proxy 默认就会带上，不必手写）
+		header_up X-Real-IP {http.request.remote.host}
+
+		# 面板的「聊天测试台」走流式返回，禁掉缓冲，否则前端要等到全部结束才出字
+		flush_interval -1
+	}
+}
+
+# ── 可选：给网关 API 配域名入口 ──────────────────────────────────────────────
+# 打开后，OpenAI 兼容客户端可以填 https://api.你的域名/v1。
+# 这是「另一种访问方式」，不是替代 —— 7863 那个端口仍然直接提供同样的服务，
+# 两者并存没有副作用，按需选一个给客户端即可。
+#
+# {$API_SITE:api.localhost} {
+#     reverse_proxy wb2api:7863 {
+#         # 模型响应是流式的，禁缓冲
+#         flush_interval -1
+#     }
+# }

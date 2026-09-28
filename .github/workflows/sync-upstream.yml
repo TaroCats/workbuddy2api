@@ -7,10 +7,12 @@
 #          FORK_FILES 里列的「fork 覆盖层」文件。落在 fork 上的其他本地提交会被丢弃 ——
 #          这是刻意的（见 FORK.md）。
 #
-# 为什么必须回填覆盖层：本文件、scripts/selfupdate.sh、docker-compose.fork.yml、FORK.md
-# 都是 fork 独有的，上游没有。硬重置会把它们从工作区里删掉 —— 若不回填，本 workflow 会在
-# 第一次同步后原地消失，之后再也不会被调度。所以流程固定为：
+# 为什么必须回填覆盖层：本文件、scripts/stack.sh、deploy/ 整个目录、docker-compose.fork.yml、
+# .env.example、FORK.md 都是 fork 独有的，上游没有。硬重置会把它们从工作区里删掉 ——
+# 若不回填，本 workflow 会在第一次同步后原地消失，之后再也不会被调度。所以流程固定为：
 #     快照覆盖层 → 硬重置到上游 → 回填覆盖层 → 提交 → force push → 触发构建
+#
+# FORK_FILES 每一项可以是**文件也可以是目录**（目录整棵保留，方便 deploy/ 这种成组文件）。
 
 name: Sync Upstream
 
@@ -43,11 +45,14 @@ env:
   TARGET_BRANCH: master
   BUILD_WORKFLOW: build.yml
   # fork 覆盖层：同步时会被原样保留（相对仓库根目录的路径，一行一个）。
-  # 新增 fork 专属文件时，记得加到这里，否则它会在下一次同步时被硬重置抹掉。
+  # 可以写文件，也可以写目录（目录整棵保留）。新增 fork 专属文件时，记得加到这里，
+  # 否则它会在下一次同步时被硬重置抹掉 —— 缺了 deploy/ 会让栈直接起不来。
   FORK_FILES: |
     .github/workflows/sync-upstream.yml
-    scripts/selfupdate.sh
+    .env.example
     docker-compose.fork.yml
+    scripts/stack.sh
+    deploy
     FORK.md
 
 jobs:
@@ -83,20 +88,33 @@ jobs:
           ORIG="$(git rev-parse HEAD)"
           BEHIND="$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")"
 
-          # 1) 快照 fork 覆盖层（硬重置会删掉这些上游没有的文件）
+          # 1) 快照 fork 覆盖层（硬重置会删掉这些上游没有的文件/目录）
           SNAP="$(mktemp -d)"
           echo "::group::快照 fork 覆盖层"
+          MISSING=0
           while IFS= read -r f; do
             [ -n "$f" ] || continue
-            if [ -f "$f" ]; then
+            if [ -d "$f" ]; then
+              mkdir -p "${SNAP}/$(dirname -- "$f")"
+              cp -a "$f" "${SNAP}/$(dirname -- "$f")/"
+              echo "  ok   ${f}/（$(find "$f" -type f | wc -l | tr -d ' ') 个文件）"
+            elif [ -f "$f" ]; then
               mkdir -p "${SNAP}/$(dirname -- "$f")"
               cp -p "$f" "${SNAP}/${f}"
               echo "  ok   ${f}"
             else
-              echo "::warning::覆盖层文件在工作区不存在，本次无法回填：${f}"
+              echo "::error::覆盖层条目在工作区不存在：${f}"
+              MISSING=1
             fi
           done <<< "${FORK_FILES}"
           echo "::endgroup::"
+
+          # 覆盖层缺件是硬故障：下一步的硬重置会把它抹掉，回填不回去就等于把 fork 打残，
+          # 而后面还有 force push。宁可在这里停住，也不要推出去一个起不来的仓库。
+          if [ "${MISSING}" -ne 0 ]; then
+            echo "::error::覆盖层有条目缺失，已中止同步（未做任何改动、未推送）"
+            exit 1
+          fi
 
           # 2) 硬重置为上游（完全镜像）
           git reset --hard "upstream/${UPSTREAM_BRANCH}"
@@ -104,12 +122,13 @@ jobs:
           # 3) 回填覆盖层
           cp -a "${SNAP}/." "${PWD}/"
 
-          # 4) 暂存。注意 .gitignore 里有 `*.md` 全局忽略（只放行 README.md），
-          #    所以覆盖层里的 .md 必须用 -f 强制加入。
+          # 4) 暂存。注意 .gitignore 里有 `*.md` 全局忽略（只放行 README.md）、
+          #    `.env.*` 全局忽略（正好命中 .env.example），所以覆盖层必须用 -f 强制加入。
+          #    这里用 -e 而不是 -f 判断存在性，因为覆盖层条目可能是目录。
           git add -A
           while IFS= read -r f; do
             [ -n "$f" ] || continue
-            if [ -f "$f" ]; then git add -f "$f"; fi
+            if [ -e "$f" ]; then git add -f -- "$f"; fi
           done <<< "${FORK_FILES}"
 
           # 5) 内容与同步前完全一致 → 不提交、不推送（避免每 12 小时产生一个空提交）

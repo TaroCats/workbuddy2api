@@ -1,18 +1,212 @@
-# docker-compose.fork.yml —— fork 专属的 compose 覆盖层（上游没有这个文件）
+# ─────────────────────────────────────────────────────────────────────────────
+# 本 fork 的完整容器栈（自包含）
 #
-# 作用：给 wb2api 服务补上 `image:`，把容器绑定到 CI 发布到 GHCR 的镜像 tag 上。
+#   启动：./scripts/stack.sh up         ← 别直接 docker compose up，见文末
+#   运维：./scripts/stack.sh status|logs|update|rollback
 #
-# 为什么需要覆盖：基础 docker-compose.yml 只声明了 `build:`、没有 `image:`，compose 会给
-# 镜像起一个本地默认名（workbuddy2api-wb2api），跟 GHCR 上的产物对不上号，于是
-# 「拉取已发布镜像并重建」这条路走不通。补上 `image:` 之后两种部署方式并存：
+# 四个容器：
+#   wb2api   网关本体       镜像来自 GHCR（CI 构建）      对外 :7863
+#   wbgui    可视化控制台   镜像在容器内从源码构建        只在内网 :8787
+#   caddy    统一反代入口   面板的唯一入口                对外 :80/:443
+#   updater  更新执行器     只指挥 docker，不含业务       不对外
 #
-#   ① 本地源码构建（与原来完全一致，只是镜像名变成了 GHCR 的 tag）
-#      docker compose -f docker-compose.yml -f docker-compose.fork.yml up -d --build
+# 为什么是「自包含」而不是叠加在上游 docker-compose.yml 上：
+#   本栈比上游多三个容器、一个网络、一套统一入口。用 base+override 叠加写，会同时
+#   存在 build: 与 image:、端口/卷各定义两处，读的人得在脑子里做一次合并才敢排障。
+#   上游的 docker-compose.yml 保持原样不动，仍可作为「完全按上游方式部署」的参考。
 #
-#   ② 拉取 CI 构建好的镜像（推荐，配合 scripts/selfupdate.sh 自动更新）
-#      ./scripts/selfupdate.sh
+# 更新机制（三个都能自动跟进，且都在容器内完成）：
+#   · wb2api   → updater 从 GHCR 拉镜像，比对镜像 ID，有变化才重建
+#   · wbgui    → updater 检测上游提交，拉源码 → docker build → 重建
+#   · 编排本身 → updater 定时 git pull 本仓库，先用 compose config 校验新配置，
+#                校验不过立刻回退，绝不带着坏配置重建
+#   宿主机上不需要任何 cron。
 #
-# 想回退成「只用基础 compose」，去掉 -f docker-compose.fork.yml 即可，基础文件未被改动。
+# 首次部署请用 ./scripts/stack.sh up：它会先生成 .env、拉下 GUI 源码并构建出面板
+# 镜像，再起栈。直接 `docker compose up -d` 会失败在「面板镜像还不存在」。
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: workbuddy
+
+# 日志集中配置：json-file 驱动默认不限制大小，网关与面板都会持续写访问日志，
+# 不加限制迟早写满磁盘。10MB × 3 份足够回溯，也不会无限增长。
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
+
+  # ── 1/4 网关本体 ───────────────────────────────────────────────────────────
   wb2api:
-    image: ghcr.io/tarocats/workbuddy2api:latest
+    image: ${WB2API_IMAGE:-ghcr.io/tarocats/workbuddy2api:latest}
+    # 刻意不写 build: —— 部署机不再本地编译 Go，镜像由 GitHub Actions 构建推 GHCR。
+    # 好处是部署机不需要 Go 工具链，且能按 commit sha 标签回滚。
+    container_name: workbuddy2api
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      # 对外发布：OpenAI 兼容客户端要直连这里（面板走 caddy，不占这个端口）。
+      # 只想让本机或反代访问，把 WB2API_BIND 改成 127.0.0.1。
+      - "${WB2API_BIND:-0.0.0.0}:7863:7863"
+    volumes:
+      # 凭证目录：login.sh 落盘 workbuddy-<uid>.json，网关以 app(uid 10001) 读写。
+      # 若宿主机是 root 落盘（属主 root），网关读不到 → 账号数为 0（上游 issue #108）。
+      # 修法：chown -R 10001:10001 ./auths
+      - ./auths:/app/auths
+      - ./data:/app/data
+      # 网关只读自己的配置；「在页面上改配置」由面板那边写（它挂的是可写的）
+      - ./config.json:/app/config.json:ro
+    networks: [wbnet]
+    logging: *logging
+    healthcheck:
+      # 镜像自带同一条 HEALTHCHECK，这里重申是为了让「健康语义」在编排文件里可见 ——
+      # /healthz 在池里没有健康账号时返回 503，而 wget 对 503 仍算成功，
+      # 即「进程起来了就算健康」。updater 靠这个语义判定更新是否成功。
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7863/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+
+  # ── 2/4 可视化控制台 ───────────────────────────────────────────────────────
+  wbgui:
+    # 面板上游只提供源码、没有现成镜像。首次由 ./scripts/stack.sh up 调用 updater
+    # 在容器内构建；之后 updater 每轮检测上游提交，有变化就重新克隆 + 构建 + 重建。
+    # 保留 build: 是为了 src/ 已经在时，`docker compose build wbgui` 也能手动构建。
+    build:
+      context: ./src/workbuddy2api-gui
+    image: ${WBGUI_IMAGE:-workbuddy2api-gui:local}
+    container_name: workbuddy2api-gui
+    restart: unless-stopped
+    # 以 root 运行：面板要写宿主机上属主为 root 的 auths/ 与 config.json。
+    # 想收紧就改成 "10001:10001"，并 chown -R 10001:10001 ./auths ./config.json
+    # （代价是丢掉「重启网关」能力，因为非 root 操作不了 docker.sock）。
+    user: "0:0"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      WBGUI_LISTEN: ":8787"
+      # 同一网络内用服务名互访 —— 面板官方示例写的是宿主网桥 IP 172.17.0.1，
+      # 换个网络环境（或 Docker Desktop）就失效，这里不沿用那个写法。
+      WBGUI_GATEWAY_URL: "http://wb2api:7863"
+      WBGUI_AUTH_DIR: "/app/auths"
+      WBGUI_CONFIG_FILE: "/gateway/config.json"
+      # 面板写出的凭证文件属主必须是网关进程的 uid（10001），否则网关读不到 ——
+      # 表现为「账号已添加但池里显示未加载」，且重启网关也无效。
+      WBGUI_AUTH_OWNER_UID: "10001"
+      WBGUI_AUTH_OWNER_GID: "10001"
+      WBGUI_BACKUP_DIR: "/data/backups"
+      WBGUI_CREDENTIALS_FILE: "/data/credentials.json"
+      WBGUI_CONTAINER: "workbuddy2api"
+      WBGUI_USERNAME: ${WBGUI_USERNAME:-admin}
+      WBGUI_PASSWORD: ${WBGUI_PASSWORD:?请在 .env 里设置面板口令（./scripts/stack.sh init 会自动生成一个随机口令）}
+      WBGUI_SESSION_TTL: ${WBGUI_SESSION_TTL:-12h}
+      WBGUI_DANGEROUS_OPS: ${WBGUI_DANGEROUS_OPS:-false}
+      WBGUI_REFRESH_CONFIG_ON_LOGIN: "true"
+      WBGUI_TIMEOUT_SECONDS: "120"
+      # 官方价格表：用来把 token 用量换算成「走官方 API 要花多少钱」。
+      # 放在 /data（wbgui-data 卷）里，容器重建不丢；文件不存在时会退回代码内置的
+      # DeepSeek 价目表，不会导致启动失败 —— 所以在面板里改完价就自然持久化了。
+      WBGUI_PRICING_FILE: "/data/pricing.json"
+      # 反代兜底：面板对写操作做同源校验，候选主机取自 Host 与 X-Forwarded-Host。
+      # caddy 默认会把两者都透传，所以正常情况下不需要填；只有你把本栈放在
+      # 「不转发任何 Host 头」的自建代理后面时，才在这里补上对外访问的域名。
+      WBGUI_ALLOWED_ORIGINS: ${WBGUI_ALLOWED_ORIGINS:-}
+      # 说明：面板的配置**全部**由这里的环境变量驱动，不再挂载 config.json ——
+      # 面板的 Load() 是「默认值 → JSON 文件 → 环境变量覆盖」，挂一个 JSON 进去也会被
+      # 上面的环境变量逐项盖掉，反而多出一个会误导人的「改了没反应」的文件。
+    volumes:
+      # 与网关共享同一份凭证目录 —— 两边必须是同一个目录，否则会出现
+      # 「面板说账号已添加、网关说没有账号」这种最难查的不一致。
+      - ./auths:/app/auths
+      # 网关配置：面板可写（页面上改签到/并发等参数），网关那边是只读挂载
+      - ./config.json:/gateway/config.json
+      # 面板自己的数据：配置备份、登录凭据、模型价格表
+      - wbgui-data:/data
+      # 「系统」页重启网关容器需要 docker 控制权。
+      # 安全提示：挂上它 ≈ 把宿主 Docker 控制权交给面板（等价宿主 root）。
+      # 不需要一键重启就把这一行删掉，其余功能不受影响。
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [wbnet]
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/api/session"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+
+  # ── 3/4 统一反代入口 ───────────────────────────────────────────────────────
+  caddy:
+    image: caddy:2-alpine
+    container_name: workbuddy-caddy
+    restart: unless-stopped
+    environment:
+      # 面板站点地址：留空 = 监听 80（用 http://<服务器IP>/ 访问，无 HTTPS）；
+      # 填域名 = 自动签发并续期证书（域名需已解析到本机且 80/443 可达）。
+      WGUI_SITE: ${WGUI_SITE:-:80}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp" # HTTP/3
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # 证书与 ACME 账号必须持久化，否则每次重建都重新申请 ——
+      # Let's Encrypt 有每周签发上限，反复重签会把自己锁死。
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - wbgui
+    networks: [wbnet]
+    logging: *logging
+
+  # ── 4/4 更新执行器 ─────────────────────────────────────────────────────────
+  updater:
+    build:
+      context: ./deploy/updater
+    image: ${UPDATER_IMAGE:-workbuddy-stack-updater:local}
+    container_name: workbuddy-updater
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # 必须与宿主机同一个绝对路径（见下面的卷）。compose 里的 ./auths 这类相对
+      # 路径要能被解析成正确的宿主机绝对路径；路径不一致就会把容器挂到空目录上，
+      # 表现为「更新一次，账号全没了」—— 这是本栈最容易踩的坑。
+      PROJECT_DIR: ${STACK_DIR:?请在 .env 里设置 STACK_DIR（./scripts/stack.sh init 会写好）}
+      COMPOSE_FILE: ${STACK_DIR:?}/docker-compose.fork.yml
+      STATE_DIR: /state
+      SERVICES: ${SERVICES:-wb2api wbgui}
+      UPDATE_INTERVAL: ${UPDATE_INTERVAL:-21600}
+      INITIAL_DELAY: ${INITIAL_DELAY:-30}
+      HEALTH_TIMEOUT: ${HEALTH_TIMEOUT:-180}
+      SELF_UPDATE: ${SELF_UPDATE:-1}
+      SELF_IMAGE: ${UPDATER_IMAGE:-workbuddy-stack-updater:local}
+      # ── wb2api：pull 模式（镜像来自 GHCR）──
+      WB2API_MODE: pull
+      WB2API_IMAGE: ${WB2API_IMAGE:-ghcr.io/tarocats/workbuddy2api:latest}
+      # ── wbgui：build 模式（上游只有源码）──
+      WBGUI_MODE: build
+      WBGUI_IMAGE: ${WBGUI_IMAGE:-workbuddy2api-gui:local}
+      WBGUI_REPO: ${WBGUI_REPO:-https://github.com/linbeize/workbuddy2api-gui.git}
+      WBGUI_REF: ${WBGUI_REF:-master}
+      WBGUI_SRC: src/workbuddy2api-gui
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 同路径挂载栈目录：它既是 compose 的工作目录，也存放 GUI 源码。
+      # 权限上它能看到 auths/ 里的凭证 —— 但它本来就持有 docker.sock
+      # （等价宿主 root），所以这没有引入新的风险等级。
+      - ${STACK_DIR:?}:${STACK_DIR:?}
+      # 更新状态：各服务的版本记录、构建日志、更新历史
+      - updater-state:/state
+    networks: [wbnet]
+    logging: *logging
+
+networks:
+  wbnet:
+    driver: bridge
+
+volumes:
+  wbgui-data:
+  caddy-data:
+  caddy-config:
+  updater-state:
