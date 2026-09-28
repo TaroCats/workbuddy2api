@@ -149,10 +149,19 @@ jobs:
           set -euo pipefail
           # 用 workflow_dispatch 而不是依赖 push 事件触发：由 GITHUB_TOKEN 产生的 push
           # 不会触发其他 workflow（GitHub 的防递归限制），所以这里显式派发一次。
-          if gh workflow run "${BUILD_WORKFLOW}" --ref "${TARGET_BRANCH}"; then
-            echo "已触发 ${BUILD_WORKFLOW}（ref=${TARGET_BRANCH}）" >> "$GITHUB_STEP_SUMMARY"
+          #
+          # --repo 必须显式给：上面给仓库加了一个名为 upstream 的 remote，gh 解析
+          # 「当前仓库」时会挑中它，请求就打到了上游 HanawaBanana/workbuddy2api，
+          # 而我们的 GITHUB_TOKEN 只对 fork 有权限 → 403 Resource not accessible
+          # by integration。用内置的 GITHUB_REPOSITORY 钉死目标，避免依赖 remote 猜测。
+          if gh workflow run "${BUILD_WORKFLOW}" \
+               --repo "${GITHUB_REPOSITORY}" \
+               --ref "${TARGET_BRANCH}"; then
+            echo "已触发 ${BUILD_WORKFLOW}（${GITHUB_REPOSITORY}@${TARGET_BRANCH}）" >> "$GITHUB_STEP_SUMMARY"
             echo "已触发 ${BUILD_WORKFLOW}，镜像构建约需 5-15 分钟。"
           else
-            echo "::warning::触发 ${BUILD_WORKFLOW} 失败。可到 Actions 页手动运行一次；\
-          另外 build.yml 自身的每日定时构建也会产出 latest 镜像，最终仍会追上。"
+            echo "::warning::触发 ${BUILD_WORKFLOW} 失败。排查顺序："
+            echo "::warning::  1) Actions 页手动 Run workflow 一次，确认 ${BUILD_WORKFLOW} 本身能跑"
+            echo "::warning::  2) 确认 ${BUILD_WORKFLOW} 未被禁用——被禁用的 workflow 无法被派发（422）"
+            echo "::warning::  3) build.yml 自身每天 04:23 UTC 有定时构建，最终仍会产出 latest"
           fi

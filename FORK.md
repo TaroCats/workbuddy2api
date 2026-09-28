@@ -30,7 +30,10 @@ sync-upstream.yml ──硬重置──▶ fork master ──② 触发──▶
 - **检测方式**：内容比对，不是 SHA 比对。同步后如果内容和同步前逐字节一致，就不产生提交、
   不 push、不触发构建（避免每 12 小时攒一个空提交）
 - **构建触发**：用 `workflow_dispatch` 显式派发 `build.yml`。**不能**依赖 push 事件——
-  GitHub 规定由 `GITHUB_TOKEN` 产生的 push 不会再触发其他 workflow（防递归），这是最容易踩的坑
+  GitHub 规定由 `GITHUB_TOKEN` 产生的 push 不会再触发其他 workflow（防递归），这是最容易踩的坑。
+  另外派发时必须写 `--repo "${GITHUB_REPOSITORY}"`：本 workflow 中途加过名为 `upstream` 的
+  remote，`gh` 解析「当前仓库」会挑中它，请求就打到了上游仓库并返回
+  `403 Resource not accessible by integration`（真实踩过，见排障表）
 - 手动 `Run workflow` 时勾选 `force` 可以跳过「无变化」判断，强制重建一次镜像
 
 ### ③ 构建镜像 — `.github/workflows/build.yml`（上游自带，未做任何修改）
@@ -100,11 +103,27 @@ Actions 第一次推包后，包默认是 **private**。到
 
 不想公开就改成登录拉取：`docker login ghcr.io -u <用户名> -p <带 read:packages 的 PAT>`。
 
-### 2. 确认 Actions 有写权限
+### 2. 确认两个 workflow 都是启用状态
 
-仓库 `Settings → Actions → General → Workflow permissions` 选 **Read and write permissions**
-（`sync-upstream.yml` 需要 push 回 `master`）。若 `master` 开了分支保护，需允许 force push，
-否则同步会失败并报错。
+**fork 里 `build.yml` 的初始状态是 `disabled_fork`（禁用）**，禁用状态下无法被
+`workflow_dispatch` 派发，同步链路会在最后一步静默失败。到
+`Actions → 左侧选中 Build & Publish → 右侧 Enable workflow` 启用即可。
+
+查询状态（`gh` 或 API）：
+
+```bash
+gh api repos/TaroCats/workbuddy2api/actions/workflows \
+  --jq '.workflows[] | "\(.name)\t\(.state)"'
+```
+
+三个都应是 `active`。也可以在 Actions 页顶部横幅点
+「I understand my workflows, go ahead and enable them」一次全开。
+
+> 关于仓库的 `Settings → Actions → General → Workflow permissions`：**保持默认的
+> Read and write 或 Read 都行**。`sync-upstream.yml` 自带
+> `permissions: {contents: write, actions: write}` 显式声明，会覆盖仓库默认值——
+> 已在真实运行日志里验证 `GITHUB_TOKEN Permissions: Actions: write, Contents: write`。
+> 只有 `master` 开了分支保护时才需要额外允许 force push，否则同步会在 push 那步失败。
 
 ---
 
@@ -128,6 +147,6 @@ Actions 第一次推包后，包默认是 **private**。到
 | --- | --- |
 | 同步后 workflow 自己消失了 | 说明 `FORK_FILES` 里漏了 `sync-upstream.yml`，或快照失败。手动把文件加回来 |
 | `push --force-with-lease` 被拒 | 远端 `master` 被人改过，或分支保护拦了 force push。看运行日志 |
-| 构建没被触发 | `build.yml` 被禁用 / 改名了。到 Actions 页确认，或手动 Run workflow（每日定时构建也会兜底） |
+| 构建没被触发（同步任务却是绿勾） | 派发失败只打 `::warning::`，不会让任务失败——一定要看 job 日志。两个已知原因：① `build.yml` 被禁用（`disabled_fork` / `disabled_manually`），422 拒绝派发；② `gh workflow run` 没带 `--repo`，gh 选中了名为 `upstream` 的 remote，请求打到上游仓库 → `403 Resource not accessible by integration` |
 | 宿主机 `docker pull` 403 | GHCR 包还是 private，见上面第 1 条 |
 | 更新后健康检查一直不过 | `docker logs --tail 100 workbuddy2api`；必要时回滚到上一个镜像 tag（`:<sha>`）并临时改 `--image` |
