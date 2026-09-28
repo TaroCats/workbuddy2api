@@ -1,0 +1,18 @@
+# docker-compose.fork.yml —— fork 专属的 compose 覆盖层（上游没有这个文件）
+#
+# 作用：给 wb2api 服务补上 `image:`，把容器绑定到 CI 发布到 GHCR 的镜像 tag 上。
+#
+# 为什么需要覆盖：基础 docker-compose.yml 只声明了 `build:`、没有 `image:`，compose 会给
+# 镜像起一个本地默认名（workbuddy2api-wb2api），跟 GHCR 上的产物对不上号，于是
+# 「拉取已发布镜像并重建」这条路走不通。补上 `image:` 之后两种部署方式并存：
+#
+#   ① 本地源码构建（与原来完全一致，只是镜像名变成了 GHCR 的 tag）
+#      docker compose -f docker-compose.yml -f docker-compose.fork.yml up -d --build
+#
+#   ② 拉取 CI 构建好的镜像（推荐，配合 scripts/selfupdate.sh 自动更新）
+#      ./scripts/selfupdate.sh
+#
+# 想回退成「只用基础 compose」，去掉 -f docker-compose.fork.yml 即可，基础文件未被改动。
+services:
+  wb2api:
+    image: ghcr.io/tarocats/workbuddy2api:latest

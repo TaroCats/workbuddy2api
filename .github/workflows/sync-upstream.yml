@@ -1,0 +1,158 @@
+# sync-upstream.yml —— fork 专属工作流（上游没有这个文件）
+#
+# 职责：定时检测 fork 源（HanawaBanana/workbuddy2api）是否有新提交，有就完全镜像过来，
+#       然后触发 build.yml 重新构建镜像并推送到 GHCR。
+#
+# 同步策略：硬重置（完全镜像）。同步后 fork 的 master = 上游 master 的内容 + 下面
+#          FORK_FILES 里列的「fork 覆盖层」文件。落在 fork 上的其他本地提交会被丢弃 ——
+#          这是刻意的（见 FORK.md）。
+#
+# 为什么必须回填覆盖层：本文件、scripts/selfupdate.sh、docker-compose.fork.yml、FORK.md
+# 都是 fork 独有的，上游没有。硬重置会把它们从工作区里删掉 —— 若不回填，本 workflow 会在
+# 第一次同步后原地消失，之后再也不会被调度。所以流程固定为：
+#     快照覆盖层 → 硬重置到上游 → 回填覆盖层 → 提交 → force push → 触发构建
+
+name: Sync Upstream
+
+on:
+  schedule:
+    # 北京时间 11:37 / 23:37（UTC 03:37 / 15:37）。
+    # 刻意避开整点：GitHub schedule 在整点排队严重，实测会迟到甚至被静默丢弃
+    # （见 build.yml 里的同类注释）。
+    - cron: '37 3,15 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '内容无变化时也强制重建镜像'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # 硬重置 + force push 到 master
+  actions: write # 触发 build.yml（workflow_dispatch）
+
+# 同一时刻只允许一趟同步，避免两次运行互相 force push。
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: HanawaBanana/workbuddy2api
+  UPSTREAM_BRANCH: master
+  TARGET_BRANCH: master
+  BUILD_WORKFLOW: build.yml
+  # fork 覆盖层：同步时会被原样保留（相对仓库根目录的路径，一行一个）。
+  # 新增 fork 专属文件时，记得加到这里，否则它会在下一次同步时被硬重置抹掉。
+  FORK_FILES: |
+    .github/workflows/sync-upstream.yml
+    scripts/selfupdate.sh
+    docker-compose.fork.yml
+    FORK.md
+
+jobs:
+  sync:
+    name: 同步上游并触发构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: 同步上游（硬重置 + 回填 fork 覆盖层）
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_URL"
+
+          echo "::group::拉取上游"
+          git fetch --no-tags --prune upstream "${UPSTREAM_BRANCH}"
+          echo "::endgroup::"
+
+          UP_SHA="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          ORIG="$(git rev-parse HEAD)"
+          BEHIND="$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")"
+
+          # 1) 快照 fork 覆盖层（硬重置会删掉这些上游没有的文件）
+          SNAP="$(mktemp -d)"
+          echo "::group::快照 fork 覆盖层"
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if [ -f "$f" ]; then
+              mkdir -p "${SNAP}/$(dirname -- "$f")"
+              cp -p "$f" "${SNAP}/${f}"
+              echo "  ok   ${f}"
+            else
+              echo "::warning::覆盖层文件在工作区不存在，本次无法回填：${f}"
+            fi
+          done <<< "${FORK_FILES}"
+          echo "::endgroup::"
+
+          # 2) 硬重置为上游（完全镜像）
+          git reset --hard "upstream/${UPSTREAM_BRANCH}"
+
+          # 3) 回填覆盖层
+          cp -a "${SNAP}/." "${PWD}/"
+
+          # 4) 暂存。注意 .gitignore 里有 `*.md` 全局忽略（只放行 README.md），
+          #    所以覆盖层里的 .md 必须用 -f 强制加入。
+          git add -A
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if [ -f "$f" ]; then git add -f "$f"; fi
+          done <<< "${FORK_FILES}"
+
+          # 5) 内容与同步前完全一致 → 不提交、不推送（避免每 12 小时产生一个空提交）
+          CHANGED=false
+          if git diff --cached --quiet "$ORIG"; then
+            echo "内容与同步前一致，跳过提交与推送"
+            git reset --hard "$ORIG"
+          else
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit -m "chore(sync): 镜像上游 ${UPSTREAM_REPO}@${UP_SHA:0:7}（保留 fork 覆盖层）"
+            echo "::group::force push 到 ${TARGET_BRANCH}"
+            git push --force-with-lease origin "HEAD:${TARGET_BRANCH}"
+            echo "::endgroup::"
+            CHANGED=true
+          fi
+
+          {
+            echo "### Sync Upstream"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游 \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\` | \`${UP_SHA:0:7}\` |"
+            echo "| 同步前 fork \`${TARGET_BRANCH}\` | \`${ORIG:0:7}\` |"
+            echo "| 上游领先 | ${BEHIND} 个提交 |"
+            echo "| 是否产生新提交 | $([ "$CHANGED" = true ] && echo '是' || echo '否') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "changed=${CHANGED}" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=${UP_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: 触发镜像构建
+        if: steps.sync.outputs.changed == 'true' || inputs.force
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 用 workflow_dispatch 而不是依赖 push 事件触发：由 GITHUB_TOKEN 产生的 push
+          # 不会触发其他 workflow（GitHub 的防递归限制），所以这里显式派发一次。
+          if gh workflow run "${BUILD_WORKFLOW}" --ref "${TARGET_BRANCH}"; then
+            echo "已触发 ${BUILD_WORKFLOW}（ref=${TARGET_BRANCH}）" >> "$GITHUB_STEP_SUMMARY"
+            echo "已触发 ${BUILD_WORKFLOW}，镜像构建约需 5-15 分钟。"
+          else
+            echo "::warning::触发 ${BUILD_WORKFLOW} 失败。可到 Actions 页手动运行一次；\
+          另外 build.yml 自身的每日定时构建也会产出 latest 镜像，最终仍会追上。"
+          fi
