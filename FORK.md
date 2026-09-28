@@ -94,14 +94,24 @@ FORK.md                               ← 本文件
 
 ---
 
-## 三、首次启用前的两件事
+## 三、上线前的两项检查
 
-### 1. 把 GHCR 包设为 public（否则宿主机拉不动）
+### 1. GHCR 包可见性（公开仓库无需操作）
 
-Actions 第一次推包后，包默认是 **private**。到
-`GitHub → 右上头像 → Your packages → workbuddy2api → Package settings → Change visibility → Public`。
+**本仓库是 public，推上去的包默认就是 public —— 已实测无需任何设置**：匿名
+`ghcr.io/token` → `tags/list` → 读 manifest 全部 200，宿主机可直接 `docker pull`。
 
-不想公开就改成登录拉取：`docker login ghcr.io -u <用户名> -p <带 read:packages 的 PAT>`。
+只有 fork 是 **private** 仓库时才需要处理：到
+`头像 → Your packages → workbuddy2api → Package settings → Change visibility → Public`，
+或改成登录拉取：`docker login ghcr.io -u <用户名> -p <带 read:packages 的 PAT>`。
+
+自查命令：
+
+```bash
+# 匿名能列出 tag 就是 public
+TK=$(curl -s "https://ghcr.io/token?scope=repository:tarocats/workbuddy2api:pull&service=ghcr.io" | jq -r .token)
+curl -s -H "Authorization: Bearer $TK" https://ghcr.io/v2/tarocats/workbuddy2api/tags/list
+```
 
 ### 2. 确认两个 workflow 都是启用状态
 
@@ -150,3 +160,20 @@ gh api repos/TaroCats/workbuddy2api/actions/workflows \
 | 构建没被触发（同步任务却是绿勾） | 派发失败只打 `::warning::`，不会让任务失败——一定要看 job 日志。两个已知原因：① `build.yml` 被禁用（`disabled_fork` / `disabled_manually`），422 拒绝派发；② `gh workflow run` 没带 `--repo`，gh 选中了名为 `upstream` 的 remote，请求打到上游仓库 → `403 Resource not accessible by integration` |
 | 宿主机 `docker pull` 403 | GHCR 包还是 private，见上面第 1 条 |
 | 更新后健康检查一直不过 | `docker logs --tail 100 workbuddy2api`；必要时回滚到上一个镜像 tag（`:<sha>`）并临时改 `--image` |
+
+---
+
+## 六、验证记录（2026-09-28 首次真机实跑）
+
+链路已跑通并留档，日后再动这些文件时可以对照：
+
+| 环节 | 证据 |
+| --- | --- |
+| 同步 | `Sync Upstream #1` / `#2` 均 success；`内容与同步前一致，跳过提交与推送`（幂等生效，未产生空提交） |
+| 派发 | `#2` 日志输出 `https://github.com/TaroCats/workbuddy2api/actions/runs/36389184456` |
+| 构建 | `Build & Publish #1` success，5m40s，多架构 `linux/amd64,linux/arm64` |
+| 产物 | `ghcr.io/tarocats/workbuddy2api:latest` = `:89ea76d…`，index digest `sha256:7874380d…`；另附 amd64 离线 tar.gz artifact |
+| 可见性 | 匿名可取 token / 列 tag / 读 manifest（均 200）→ 包是 public，宿主机可直接 pull |
+
+首次实跑揪出了两个本地测不出的 bug（`build.yml` 在 fork 里是 `disabled_fork`；`gh workflow run`
+未带 `--repo` 导致请求打到上游仓库被 403 拒绝），已在 `fix(ci)` 提交中修复，排障表有记录。
